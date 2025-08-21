@@ -20,7 +20,7 @@ GridPos = Tuple[int, int]
 @dataclass
 class Settings:
     grid_cells: int = 25
-    move_interval_ms: int = 160  # ~6.25 moves/second for a relaxed pace
+    move_interval_ms: int = 128  # 20% faster than 160ms
     point_spawn_interval_ms: int = 3000
     game_duration_ms: int = 2 * 60 * 1000  # 2-minute matches
     respawn_delay_ms: int = 5000
@@ -58,6 +58,25 @@ class AssetLoader:
         self.ko_effect = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "KOEffect.png")).convert_alpha()
         self.times_up = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "TimesUp.png")).convert_alpha()
         self.logo = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "SSLogo.png")).convert_alpha()
+        self.victory_logo = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "VictoryLogo.png")).convert_alpha()
+        self.arrow_keys = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "ArrowKeys.png")).convert_alpha()
+        self.controls_text = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "ControlsText.png")).convert_alpha()
+        self.movement_text = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "MovementText.png")).convert_alpha()
+        self.pause_text = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "PauseText.png")).convert_alpha()
+        self.esc_key = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "EscKey.png")).convert_alpha()
+        self.high_score_icon = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "HighScore.png")).convert_alpha()
+        # Sounds (optional)
+        try:
+            self.sfx_knockout = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "KnockoutSound.mp3"))
+            self.sfx_revive = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "ReviveSound.mp3"))
+            self.sfx_point = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "PointSound.mp3"))
+            self.sfx_knockout.set_volume(0.4)
+            self.sfx_revive.set_volume(0.32)
+            self.sfx_point.set_volume(0.32)
+        except Exception:
+            self.sfx_knockout = None
+            self.sfx_revive = None
+            self.sfx_point = None
 
         # Player segments 2..16
         self.player_segments: List[pygame.Surface] = []
@@ -251,6 +270,9 @@ class Game:
         self.current_match_duration_ms: int = self.settings.game_duration_ms
         # Whether to skip tally counters at end (winner by default conditions)
         self.skip_tally: bool = False
+        # Menu Start flashing state
+        self.menu_start_triggered_ms: int = 0
+        self.menu_flash_start_button: bool = False
 
         # Snakes setup: near borders facing inward
         player_start = (2, self.grid_cells // 2)
@@ -276,10 +298,15 @@ class Game:
         self.font_counter = pygame.font.SysFont(None, int(self.tile_size * 1.8))
         # 3x larger for countdown and end-game banners
         self.font_huge = pygame.font.SysFont(None, int(self.tile_size * 1.2 * 3))
+        # 75% larger than medium for Start button label
+        self.font_button = pygame.font.SysFont(None, int(self.tile_size * 0.9 * 1.75))
         self._knockout_cache: Optional[pygame.Surface] = None
 
         # Prepare Timer UI scaling to fit top bar
         self._prepare_timer_ui()
+        # Menu grid overlay toggle
+        self.menu_grid_overlay = self._create_menu_grid_overlay()
+        self.show_menu_grid: bool = False
 
     # ------------- High Score Persistence -------------
     def high_score_path(self) -> str:
@@ -309,6 +336,26 @@ class Game:
             duration_ms if duration_ms is not None else self.settings.game_duration_ms
         )
         self.reset_world()
+        self.menu_start_triggered_ms = 0
+        if hasattr(self, '_menu_pending_duration_ms'):
+            delattr(self, '_menu_pending_duration_ms')
+        # Spawn 3 point teasers during countdown so they "spawn in" before play starts
+        occupied = set(self.player.body)
+        for e in self.enemies:
+            occupied.update(e.body)
+        spawned = 0
+        attempts = 0
+        while spawned < 3 and attempts < 500:
+            attempts += 1
+            x = random.randint(0, self.grid_cells - 1)
+            y = random.randint(0, self.grid_cells - 1)
+            cell = (x, y)
+            if cell in occupied:
+                continue
+            if cell in self.points or any(t[0] == cell for t in self.point_teasers):
+                continue
+            self.point_teasers.append((cell, now_ms))
+            spawned += 1
 
     def start_game(self, now_ms: int) -> None:
         self.state = "PLAYING"
@@ -341,6 +388,7 @@ class Game:
         self._tally_index = 0
         self._tally_count = 0
         self._tally_last_tick_ms = 0
+        self._tally_counts = [0, 0, 0]
         self.state = "GAME_OVER"
 
     def _pause_game(self) -> None:
@@ -401,6 +449,16 @@ class Game:
                 self.start_game(now_ms)
             return
 
+        # Handle menu start flashing delay before leaving MENU
+        if self.state == "MENU" and self.menu_start_triggered_ms:
+            if now_ms - self.menu_start_triggered_ms >= 2000:
+                # Decide duration: dev test if specified
+                duration = getattr(self, '_menu_pending_duration_ms', None)
+                if hasattr(self, '_menu_pending_duration_ms'):
+                    delattr(self, '_menu_pending_duration_ms')
+                self.start_countdown(now_ms, duration_ms=duration if duration is not None else self.settings.game_duration_ms)
+            return
+
         if self.state == "PAUSED":
             # Frozen
             return
@@ -419,9 +477,23 @@ class Game:
             return
 
         # Respawns
+        player_was_elim = self.player.eliminated
+        enemy_was_elim = [e.eliminated for e in self.enemies]
         self.player.try_respawn(now_ms)
         for e in self.enemies:
             e.try_respawn(now_ms)
+        # Play revive sfx on transitions
+        if player_was_elim and not self.player.eliminated and getattr(self.assets, 'sfx_revive', None):
+            try:
+                self.assets.sfx_revive.play()
+            except Exception:
+                pass
+        for was, e in zip(enemy_was_elim, self.enemies):
+            if was and not e.eliminated and getattr(self.assets, 'sfx_revive', None):
+                try:
+                    self.assets.sfx_revive.play()
+                except Exception:
+                    pass
 
         # Spawn points periodically
         if now_ms - self.last_point_spawn_ms >= self.settings.point_spawn_interval_ms:
@@ -500,6 +572,12 @@ class Game:
             self.points.remove(snake.head)
             snake.score += 1
             snake.pending_growth += 1
+            # Play point SFX for player only
+            if is_player and getattr(self.assets, 'sfx_point', None):
+                try:
+                    self.assets.sfx_point.play()
+                except Exception:
+                    pass
 
     def resolve_collisions(self, now_ms: int) -> None:
         snakes = [self.player] + self.enemies
@@ -512,9 +590,19 @@ class Game:
                 # Stop at boundary by reverting to previous in-bounds position
                 s.body = list(s.prev_body)
                 self._set_ko_effect_for_snake(s)
+                if getattr(self.assets, 'sfx_knockout', None):
+                    try:
+                        self.assets.sfx_knockout.play()
+                    except Exception:
+                        pass
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
             elif s.collides_with_self():
                 self._set_ko_effect_for_snake(s)
+                if getattr(self.assets, 'sfx_knockout', None):
+                    try:
+                        self.assets.sfx_knockout.play()
+                    except Exception:
+                        pass
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
 
         # Pairwise collisions using head rules
@@ -540,6 +628,11 @@ class Game:
         for s in to_eliminate:
             if not s.eliminated:
                 self._set_ko_effect_for_snake(s)
+                if getattr(self.assets, 'sfx_knockout', None):
+                    try:
+                        self.assets.sfx_knockout.play()
+                    except Exception:
+                        pass
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
 
     # -------------------- Render --------------------
@@ -635,6 +728,19 @@ class Game:
             pygame.draw.line(overlay, line_color, (0, y), (self.world_size_px[0], y))
         return overlay
 
+    def _create_menu_grid_overlay(self) -> pygame.Surface:
+        overlay = pygame.Surface(self.screen_size_px, pygame.SRCALPHA)
+        line_color = (255, 255, 255, 40)
+        cols = (self.screen_size_px[0] // self.tile_size) + 1
+        rows = (self.screen_size_px[1] // self.tile_size) + 1
+        for i in range(cols + 1):
+            x = i * self.tile_size
+            pygame.draw.line(overlay, line_color, (x, 0), (x, self.screen_size_px[1]))
+        for j in range(rows + 1):
+            y = j * self.tile_size
+            pygame.draw.line(overlay, line_color, (0, y), (self.screen_size_px[0], y))
+        return overlay
+
     def draw_points(self) -> None:
         # Draw teasers (white) with 0.6s lead-in: scale pulse and fade
         now = pygame.time.get_ticks()
@@ -654,6 +760,15 @@ class Game:
                 px, py = self.grid_to_px(cell)
                 rect = img.get_rect(center=(px + self.tile_size // 2, py + self.tile_size // 2))
                 self.screen.blit(img, rect)
+            else:
+                # After 0.6s, keep teaser visible during COUNTDOWN/PREFIGHT until promotion
+                if self.state in ("COUNTDOWN", "PREFIGHT"):
+                    img = self.assets.point_white.copy()
+                    img = pygame.transform.smoothscale(img, (self.tile_size, self.tile_size))
+                    img.set_alpha(255)
+                    px, py = self.grid_to_px(cell)
+                    rect = img.get_rect(center=(px + self.tile_size // 2, py + self.tile_size // 2))
+                    self.screen.blit(img, rect)
         # Draw actual points
         for p in self.points:
             self.screen.blit(self.assets.point, self.grid_to_px(p))
@@ -785,9 +900,17 @@ class Game:
             remaining = max(0, 3000 - t)
             num = 1 + remaining // 1000
             msg = str(int(num))
-            surf2 = self.font_huge.render(msg, True, (255, 255, 0))
+            # 40% larger than font_huge
+            enlarged_font = pygame.font.SysFont(None, int(self.font_huge.get_height() * 1.4))
+            surf2 = enlarged_font.render(msg, True, (255, 255, 255))
             rect = surf2.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
-            self.screen.blit(surf2, rect)
+            # Draw blue box with black border behind number
+            pad = int(self.tile_size * 0.6)
+            box_outer = rect.inflate(pad * 2, pad)
+            pygame.draw.rect(self.screen, (0, 0, 0), box_outer, border_radius=10)
+            box_inner = box_outer.inflate(-4, -4)
+            pygame.draw.rect(self.screen, (50, 120, 255), box_inner, border_radius=8)
+            self.screen.blit(surf2, surf2.get_rect(center=box_inner.center))
 
         # Show respawn countdown whenever the player is knocked out
         if self.state == "PLAYING" and self.player.eliminated:
@@ -795,7 +918,8 @@ class Game:
             if now >= self.player.death_anim_end_ms:
                 remaining = max(0, (self.player.inactive_until_ms - now) // 1000)
                 msg = f"Respawn in {remaining}s"
-                overlay = self.font_large.render(msg, True, (255, 255, 255))
+                respawn_font = pygame.font.SysFont(None, int(self.font_large.get_height() * 1.5))
+                overlay = respawn_font.render(msg, True, (255, 255, 255))
                 rect = overlay.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
                 self.screen.blit(overlay, rect)
 
@@ -805,15 +929,18 @@ class Game:
         dim.fill((0, 0, 0, 150))
         self.screen.blit(dim, (0, 0))
 
-        title = self.font_large.render("Paused", True, (255, 255, 255))
-        title_rect = title.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.35)))
+        # Enlarge and move down Paused title
+        paused_font = pygame.font.SysFont(None, self.font_large.get_height() + self.tile_size)
+        title = paused_font.render("Paused", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.35) + self.tile_size))
         self.screen.blit(title, title_rect)
 
-        btn_w, btn_h = int(self.tile_size * 6), int(self.tile_size * 2)
+        # Enlarge buttons by 1 tile in both dimensions
+        btn_w, btn_h = int(self.tile_size * 6) + self.tile_size, int(self.tile_size * 2) + self.tile_size
         gap = int(self.tile_size * 0.8)
         # Continue button
         cont_rect = pygame.Rect(0, 0, btn_w, btn_h)
-        cont_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.5))
+        cont_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.5) + self.tile_size)
         # Main menu button
         menu_rect = pygame.Rect(0, 0, btn_w, btn_h)
         menu_rect.center = (self.screen_size_px[0] // 2, cont_rect.bottom + gap + btn_h // 2)
@@ -837,53 +964,143 @@ class Game:
         remaining = max(0, 3000 - t)
         num = 1 + remaining // 1000
         msg = str(int(num))
-        surf = self.font_large.render(msg, True, (255, 255, 255))
+        big_font = pygame.font.SysFont(None, self.font_large.get_height() + 3 * self.tile_size)
+        surf = big_font.render(msg, True, (255, 255, 255))
         rect = surf.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
         self.screen.blit(surf, rect)
 
     def draw_menu(self) -> None:
-        # Logo
-        max_w = int(self.screen_size_px[0] * 0.8)
-        scale = min(1.0, max_w / max(1, self.assets.logo.get_width()))
+        # Logo (move up by 20%, scale +10%)
+        max_w = int(self.screen_size_px[0] * 0.88)
+        scale = min(1.0, max_w / max(1, self.assets.logo.get_width())) * 1.1
         logo = pygame.transform.smoothscale(
             self.assets.logo,
             (int(self.assets.logo.get_width() * scale), int(self.assets.logo.get_height() * scale)),
         )
-        prompt = self.font_medium.render("Click Start", True, (255, 255, 0))
-        high = self.font_small.render(f"High Score: {self.high_score}", True, (200, 200, 255))
+        prompt = self.font_button.render("Start", True, (255, 255, 0))
+        # High score icon + value
+        hs_h = int(self.tile_size * 2.0)
+        hs_scale = hs_h / max(1, self.assets.high_score_icon.get_height())
+        hs_w = int(self.assets.high_score_icon.get_width() * hs_scale)
+        hs_img = pygame.transform.smoothscale(self.assets.high_score_icon, (hs_w, hs_h))
 
-        title_rect = logo.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.30)))
-        btn_w, btn_h = int(self.tile_size * 6), int(self.tile_size * 2)
-        btn_rect = pygame.Rect(0, 0, btn_w, btn_h)
-        btn_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.6))
+        title_rect = logo.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.30 * 0.8)))
+        btn_w, btn_h = int(self.tile_size * 6 * 1.2), int(self.tile_size * 2 * 1.2)
+        btn_rect = pygame.Rect(0, 0, btn_w + self.tile_size, btn_h + self.tile_size)
+        btn_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.6 * 0.8))
+        # Move Start down by 1 tile (net effect: up one tile compared to previous +2)
+        btn_rect.centery += 1 * self.tile_size
 
         self.screen.blit(logo, title_rect)
-        self.screen.blit(high, (title_rect.left, title_rect.bottom + 10))
+        # Draw High Score icon and value to the right with 1 tile gap
+        hs_rect = hs_img.get_rect(midleft=(title_rect.left, title_rect.bottom + hs_h // 2))
+        self.screen.blit(hs_img, hs_rect)
+        # High score number in Start button yellow, inside blue box with black border; font height increased by 1 tile
+        hs_font = pygame.font.SysFont(None, int(self.tile_size * 1.7))
+        score_txt = hs_font.render(str(self.high_score), True, (255, 255, 0))
+        score_rect = score_txt.get_rect(midleft=(hs_rect.right + self.tile_size, hs_rect.centery))
+        # Draw black border box then blue inner box
+        pad = 8
+        box_outer = score_rect.inflate(pad * 2, pad)
+        pygame.draw.rect(self.screen, (0, 0, 0), box_outer, border_radius=6)
+        box_inner = box_outer.inflate(-4, -4)
+        pygame.draw.rect(self.screen, (50, 120, 255), box_inner, border_radius=6)
+        self.screen.blit(score_txt, score_txt.get_rect(center=box_inner.center))
 
         pygame.draw.rect(self.screen, (0, 0, 0), btn_rect, border_radius=8)
         inner = btn_rect.inflate(-4, -4)
-        pygame.draw.rect(self.screen, (50, 120, 255), inner, border_radius=8)
-        p_rect = prompt.get_rect(center=inner.center)
-        self.screen.blit(prompt, p_rect)
+        # Determine flashing state if triggered
+        flash_active = False
+        if self.menu_start_triggered_ms:
+            elapsed = pygame.time.get_ticks() - self.menu_start_triggered_ms
+            # Flash for 1s: 3 flashes within 1 second
+            if elapsed < 1000:
+                phase = elapsed / 1000.0
+                flash_points = [0.17, 0.50, 0.83]
+                flash_active = any(abs(phase - fp) < 0.09 for fp in flash_points)
+        # Draw button, flashing whole button when active
+        if self.menu_start_triggered_ms and flash_active:
+            pygame.draw.rect(self.screen, (230, 230, 230), inner, border_radius=8)
+        else:
+            pygame.draw.rect(self.screen, (50, 120, 255), inner, border_radius=8)
+        # Start label constant
+        start_label = prompt
+        p_rect = start_label.get_rect(center=inner.center)
+        self.screen.blit(start_label, p_rect)
 
         self._menu_button_rect = btn_rect  # cache for click detection
 
-        # Dev Test Arena button (20-second match)
-        dev_btn = pygame.Rect(0, 0, btn_w, btn_h)
-        dev_btn.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.75))
-        pygame.draw.rect(self.screen, (0, 0, 0), dev_btn, border_radius=8)
+        # Dev Test Arena button (small, bottom-left)
+        dev_w, dev_h = int(self.tile_size * 4), int(self.tile_size * 1.2)
+        dev_btn = pygame.Rect(16, self.screen_size_px[1] - dev_h - 16, dev_w, dev_h)
+        pygame.draw.rect(self.screen, (0, 0, 0), dev_btn, border_radius=6)
         inner2 = dev_btn.inflate(-4, -4)
-        pygame.draw.rect(self.screen, (120, 50, 255), inner2, border_radius=8)
-        dev_label = self.font_medium.render("Dev Test Arena", True, (255, 255, 255))
+        pygame.draw.rect(self.screen, (120, 50, 255), inner2, border_radius=6)
+        dev_label = self.font_small.render("Dev Test Arena", True, (255, 255, 255))
         self.screen.blit(dev_label, dev_label.get_rect(center=inner2.center))
         self._menu_dev_button_rect = dev_btn
 
+        # Controls blurb under Start using provided images
+        # "Controls:" banner moved up by 2 tiles relative to previous
+        ctrl_h = int(self.tile_size * 1.2)
+        scale = ctrl_h / max(1, self.assets.controls_text.get_height())
+        ctrl_w = int(self.assets.controls_text.get_width() * scale)
+        ctrl_img = pygame.transform.smoothscale(self.assets.controls_text, (ctrl_w, ctrl_h))
+        controls_rect = ctrl_img.get_rect(center=(self.screen_size_px[0] // 2, btn_rect.bottom + int(self.tile_size * 1.8)))
+        self.screen.blit(ctrl_img, controls_rect)
+
+        # Movement line with icon left-aligned (text 125%, icon 3.7 tiles), moved down by 2 tiles
+        mv_h = int(self.tile_size * 1.25)
+        mv_scale = mv_h / max(1, self.assets.movement_text.get_height())
+        mv_w = int(self.assets.movement_text.get_width() * mv_scale)
+        mv_img = pygame.transform.smoothscale(self.assets.movement_text, (mv_w, mv_h))
+        # Place Movement text: 6 tiles from left, 7 tiles up from bottom (down by 2 tiles from 9)
+        move_rect = mv_img.get_rect(bottomleft=(int(self.tile_size * 6), self.screen_size_px[1] - int(self.tile_size * 7)))
+        self.screen.blit(mv_img, move_rect)
+        # Arrow keys to the right of Movement by 1 tile, follows movement vertical
+        arrow_h = int(self.tile_size * 3.7)
+        a_scale = arrow_h / max(1, self.assets.arrow_keys.get_height())
+        arrow_w = int(self.assets.arrow_keys.get_width() * a_scale)
+        arrow_img = pygame.transform.smoothscale(self.assets.arrow_keys, (arrow_w, arrow_h))
+        arrow_rect = arrow_img.get_rect(midleft=(move_rect.right + 1 * self.tile_size, move_rect.centery))
+        self.screen.blit(arrow_img, arrow_rect)
+
+        # Pause line left-aligned (text 125%) 3 tiles up from bottom (down by 2 tiles from 5)
+        pause_h = int(self.tile_size * 1.25)
+        p_scale = pause_h / max(1, self.assets.pause_text.get_height())
+        pause_w = int(self.assets.pause_text.get_width() * p_scale)
+        pause_img = pygame.transform.smoothscale(self.assets.pause_text, (pause_w, pause_h))
+        pause_rect = pause_img.get_rect(bottomleft=(int(self.tile_size * 6), self.screen_size_px[1] - int(self.tile_size * 3)))
+        self.screen.blit(pause_img, pause_rect)
+        # ESC icon to the right of Pause by 2 tiles at 2.5 tiles tall
+        esc_h = int(self.tile_size * 2.5)
+        e_scale = esc_h / max(1, self.assets.esc_key.get_height())
+        esc_w = int(self.assets.esc_key.get_width() * e_scale)
+        esc_img = pygame.transform.smoothscale(self.assets.esc_key, (esc_w, esc_h))
+        esc_rect = esc_img.get_rect(midleft=(pause_rect.right + 2 * self.tile_size, pause_rect.centery))
+        self.screen.blit(esc_img, esc_rect)
+
+        # Grid toggle removed per request
+
     def draw_game_over(self) -> None:
-        msg = self.font_huge.render(self.result_text, True, (255, 200, 50))
-        info = self.font_small.render("Click to return to Menu", True, (230, 230, 230))
-        rect = msg.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.45)))
-        self.screen.blit(msg, rect)
-        self.screen.blit(info, (rect.left, rect.bottom + 10))
+        if self.result_text == "You Win!":
+            # Replace win text with VictoryLogo image
+            img = self.assets.victory_logo
+            max_w = int(self.world_rect.width * 0.7)
+            scale = min(1.0, max_w / max(1, img.get_width()))
+            target = pygame.transform.smoothscale(img, (int(img.get_width() * scale), int(img.get_height() * scale)))
+            rect = target.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.45)))
+            self.screen.blit(target, rect)
+        else:
+            msg = self.font_huge.render(self.result_text, True, (255, 200, 50))
+            rect = msg.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.45)))
+            # Draw blue box with black border behind Game Over text
+            pad = 16
+            box_outer = rect.inflate(pad * 2, pad)
+            pygame.draw.rect(self.screen, (0, 0, 0), box_outer, border_radius=10)
+            box_inner = box_outer.inflate(-4, -4)
+            pygame.draw.rect(self.screen, (50, 120, 255), box_inner, border_radius=8)
+            self.screen.blit(msg, msg.get_rect(center=box_inner.center))
 
     def draw_tally_counters(self) -> None:
         # Tick the counter faster (75% faster than prior 250ms -> ~143ms)
@@ -966,7 +1183,8 @@ class Game:
         gray_surface.blit(fade, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
         self.screen.blit(gray_surface, self.world_rect.topleft)
         # Countdown is drawn by draw_hud; additionally show KO text
-        ko = self.font_medium.render("Knocked Out", True, (255, 255, 255))
+        ko_font = pygame.font.SysFont(None, int(self.font_medium.get_height() * 1.5))
+        ko = ko_font.render("Knocked Out", True, (255, 255, 255))
         rect = ko.get_rect(center=(self.world_rect.centerx, int(self.world_rect.top + self.world_rect.height * 0.4)))
         self.screen.blit(ko, rect)
 
@@ -1052,18 +1270,49 @@ class Game:
         if self.state == "MENU":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if hasattr(self, "_menu_button_rect") and self._menu_button_rect.collidepoint(event.pos):
-                    self.start_countdown(pygame.time.get_ticks(), duration_ms=self.settings.game_duration_ms)
+                    # Start 2s flash animation before leaving menu
+                    self.menu_start_triggered_ms = pygame.time.get_ticks()
+                    self.menu_flash_start_button = True
+                    if getattr(self.assets, 'sfx_revive', None):
+                        try:
+                            self.assets.sfx_revive.play()
+                        except Exception:
+                            pass
                 elif hasattr(self, "_menu_dev_button_rect") and self._menu_dev_button_rect.collidepoint(event.pos):
                     # 20-second test arena
-                    self.start_countdown(pygame.time.get_ticks(), duration_ms=20 * 1000)
+                    self.menu_start_triggered_ms = pygame.time.get_ticks()
+                    self.menu_flash_start_button = False
+                    if getattr(self.assets, 'sfx_revive', None):
+                        try:
+                            self.assets.sfx_revive.play()
+                        except Exception:
+                            pass
+                    # Flag dev test by setting a temp field
+                    self._menu_pending_duration_ms = 20 * 1000
+                elif hasattr(self, "_menu_grid_button_rect") and self._menu_grid_button_rect.collidepoint(event.pos):
+                    self.show_menu_grid = not self.show_menu_grid
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 # No-op in menu
                 pass
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self.menu_start_triggered_ms = pygame.time.get_ticks()
+                self.menu_flash_start_button = True
+                if getattr(self.assets, 'sfx_revive', None):
+                    try:
+                        self.assets.sfx_revive.play()
+                    except Exception:
+                        pass
         elif self.state == "GAME_OVER":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.state = "MENU"
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.menu_start_triggered_ms = 0
+                if hasattr(self, '_menu_pending_duration_ms'):
+                    delattr(self, '_menu_pending_duration_ms')
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_SPACE):
                 self.state = "MENU"
+                self.menu_start_triggered_ms = 0
+                if hasattr(self, '_menu_pending_duration_ms'):
+                    delattr(self, '_menu_pending_duration_ms')
         elif self.state in ("COUNTDOWN", "PLAYING"):
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_RIGHT, pygame.K_d):
@@ -1083,7 +1332,11 @@ class Game:
                 if hasattr(self, "_pause_continue_rect") and self._pause_continue_rect.collidepoint(event.pos):
                     self._resume_with_countdown()
                 elif hasattr(self, "_pause_menu_rect") and self._pause_menu_rect.collidepoint(event.pos):
+                    # Return to main menu and clear any pending auto-start
                     self.state = "MENU"
+                    self.menu_start_triggered_ms = 0
+                    if hasattr(self, '_menu_pending_duration_ms'):
+                        delattr(self, '_menu_pending_duration_ms')
         elif self.state == "PAUSE_COUNTDOWN":
             # Ignore inputs during countdown except ESC to return to PAUSED
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
@@ -1109,6 +1362,17 @@ def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pygame.init()
     pygame.display.set_caption("Serpent Showdown")
+    # Global music: loop main theme across all screens
+    try:
+        pygame.mixer.init()
+        music_path = os.path.join(base_dir, "assets", "sounds", "MainTheme.mp3")
+        if os.path.exists(music_path):
+            pygame.mixer.music.load(music_path)
+            pygame.mixer.music.set_volume(0.54)
+            pygame.mixer.music.play(-1)
+    except Exception:
+        # Audio is optional; continue without music if unavailable
+        pass
 
     grid_cells = 25
     # Fixed world 600x600 (24px tiles), UI 120px tall, window 600x720
