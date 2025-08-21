@@ -50,6 +50,7 @@ class AssetLoader:
         self.enemy_head_ko = load_image("enemyKnockout.png")
         self.enemy_segment = load_image("EnemySegment.png")
         self.point = load_image("DiamondPoint.png")
+        self.point_white = load_image("DiamondPointWhite.png")
         # UI
         self.timer_ui = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "TimerUI.png")).convert_alpha()
         self.fight_ui_dark = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUIDark.png")).convert_alpha()
@@ -228,6 +229,7 @@ class Game:
 
         # State
         self.points: List[GridPos] = []
+        self.point_teasers: List[Tuple[GridPos, int]] = []  # (cell, start_ms)
         self.last_point_spawn_ms: int = 0
         self.last_move_ms: int = 0
         self.start_time_ms: int = 0
@@ -263,6 +265,7 @@ class Game:
 
         # Pre-scale background to window
         self.bg_blue_scaled = self.assets.scale_blue_background(*self.world_size_px)
+        self.bg_blue_full = self.assets.scale_blue_background(*self.screen_size_px)
         # Create transparent grid overlay
         self.grid_overlay = self._create_grid_overlay()
 
@@ -271,6 +274,8 @@ class Game:
         self.font_medium = pygame.font.SysFont(None, int(self.tile_size * 0.9))
         self.font_small = pygame.font.SysFont(None, int(self.tile_size * 0.7))
         self.font_counter = pygame.font.SysFont(None, int(self.tile_size * 1.8))
+        # 3x larger for countdown and end-game banners
+        self.font_huge = pygame.font.SysFont(None, int(self.tile_size * 1.2 * 3))
         self._knockout_cache: Optional[pygame.Surface] = None
 
         # Prepare Timer UI scaling to fit top bar
@@ -423,6 +428,17 @@ class Game:
             self.spawn_points()
             self.last_point_spawn_ms = now_ms
 
+        # Promote teasers to real points after 0.6s
+        if self.point_teasers:
+            new_teasers: List[Tuple[GridPos, int]] = []
+            for cell, start in self.point_teasers:
+                if now_ms - start >= 600:
+                    if cell not in self.points:
+                        self.points.append(cell)
+                else:
+                    new_teasers.append((cell, start))
+            self.point_teasers = new_teasers
+
         # Movement pacing (continuous interpolation used for rendering; logic steps here)
         if now_ms - self.last_move_ms >= self.settings.move_interval_ms:
             self.last_move_ms = now_ms
@@ -440,8 +456,10 @@ class Game:
             for _attempt in range(200):
                 x = random.randint(0, self.grid_cells - 1)
                 y = random.randint(0, self.grid_cells - 1)
-                if (x, y) not in occupied and (x, y) not in self.points:
-                    self.points.append((x, y))
+                cell = (x, y)
+                if cell not in occupied and cell not in self.points and all(t[0] != cell for t in self.point_teasers):
+                    # Start a teaser 0.4s before point appears
+                    self.point_teasers.append((cell, pygame.time.get_ticks()))
                     break
 
     def drive_enemies(self) -> None:
@@ -526,11 +544,16 @@ class Game:
 
     # -------------------- Render --------------------
     def draw(self) -> None:
-        # Clear full screen with blue background scaled to world size for consistency
+        # Clear and draw background layers based on state
         self.screen.fill((0, 0, 0))
-        self.screen.blit(self.bg_blue_scaled, self.world_rect.topleft)
-        # Transparent grid overlay within world rect
-        self.screen.blit(self.grid_overlay, self.world_rect.topleft)
+        if self.state == "MENU":
+            # On title, use full-screen background and no top UI bar area
+            self.screen.blit(self.bg_blue_full, (0, 0))
+        else:
+            # In matches and other states, show world-only background with UI bar
+            self.screen.blit(self.bg_blue_scaled, self.world_rect.topleft)
+            # Transparent grid overlay within world rect
+            self.screen.blit(self.grid_overlay, self.world_rect.topleft)
 
         if self.state == "MENU":
             self.draw_menu()
@@ -613,6 +636,25 @@ class Game:
         return overlay
 
     def draw_points(self) -> None:
+        # Draw teasers (white) with 0.6s lead-in: scale pulse and fade
+        now = pygame.time.get_ticks()
+        for cell, start in self.point_teasers:
+            t = now - start
+            if t < 600:
+                alpha = int(255 * (t / 600.0))
+                # Pulse scale 0.9->1.1->1.0 across 0.6s
+                phase = t / 600.0
+                if phase < 0.5:
+                    scale = 0.9 + 0.2 * (phase / 0.5)
+                else:
+                    scale = 1.1 - 0.1 * ((phase - 0.5) / 0.5)
+                img = self.assets.point_white.copy()
+                img = pygame.transform.smoothscale(img, (int(self.tile_size * scale), int(self.tile_size * scale)))
+                img.set_alpha(alpha)
+                px, py = self.grid_to_px(cell)
+                rect = img.get_rect(center=(px + self.tile_size // 2, py + self.tile_size // 2))
+                self.screen.blit(img, rect)
+        # Draw actual points
         for p in self.points:
             self.screen.blit(self.assets.point, self.grid_to_px(p))
 
@@ -743,7 +785,7 @@ class Game:
             remaining = max(0, 3000 - t)
             num = 1 + remaining // 1000
             msg = str(int(num))
-            surf2 = self.font_large.render(msg, True, (255, 255, 0))
+            surf2 = self.font_huge.render(msg, True, (255, 255, 0))
             rect = surf2.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
             self.screen.blit(surf2, rect)
 
@@ -837,7 +879,7 @@ class Game:
         self._menu_dev_button_rect = dev_btn
 
     def draw_game_over(self) -> None:
-        msg = self.font_large.render(self.result_text, True, (255, 200, 50))
+        msg = self.font_huge.render(self.result_text, True, (255, 200, 50))
         info = self.font_small.render("Click to return to Menu", True, (230, 230, 230))
         rect = msg.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.45)))
         self.screen.blit(msg, rect)
@@ -941,7 +983,7 @@ class Game:
         self._timer_text_center = self._timer_ui_rect.center
 
     def draw_prefight(self) -> None:
-        # 1s total: two flashes in the first 0.5s, then slide off-screen
+        # 1s total: two flashes in the first 0.5s, then disappear
         t_ms = pygame.time.get_ticks() - self.prefight_start_ms
         center = (self.world_rect.centerx, self.world_rect.centery)
         # Scale fight UI to about 60% of world width
@@ -952,15 +994,7 @@ class Game:
         scale = max_w / img.get_width()
         target_size = (int(img.get_width() * scale), int(img.get_height() * scale))
         frame = pygame.transform.smoothscale(img, target_size)
-
-        # Slide off-screen to the right during last 0.3s (700ms -> 1000ms)
-        if t_ms >= 700:
-            slide_frac = min(1.0, (t_ms - 700) / 300.0)
-            offset_x = int(slide_frac * (self.world_rect.width // 2 + target_size[0]))
-        else:
-            offset_x = 0
-
-        rect = frame.get_rect(center=(center[0] + offset_x, center[1]))
+        rect = frame.get_rect(center=center)
         self.screen.blit(frame, rect)
 
     def _set_ko_effect_for_snake(self, snake: Snake) -> None:
