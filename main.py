@@ -70,9 +70,13 @@ class AssetLoader:
             self.sfx_knockout = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "KnockoutSound.mp3"))
             self.sfx_revive = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "ReviveSound.mp3"))
             self.sfx_point = pygame.mixer.Sound(os.path.join(self.base_dir, "assets", "sounds", "PointSound.mp3"))
-            self.sfx_knockout.set_volume(0.4)
-            self.sfx_revive.set_volume(0.32)
-            self.sfx_point.set_volume(0.32)
+            # Base volumes (post-reduction); will be scaled by master volume in Game
+            self.knockout_base = 0.24
+            self.revive_base = 0.192
+            self.point_base = 0.192
+            self.sfx_knockout.set_volume(self.knockout_base)
+            self.sfx_revive.set_volume(self.revive_base)
+            self.sfx_point.set_volume(self.point_base)
         except Exception:
             self.sfx_knockout = None
             self.sfx_revive = None
@@ -301,6 +305,33 @@ class Game:
         # 75% larger than medium for Start button label
         self.font_button = pygame.font.SysFont(None, int(self.tile_size * 0.9 * 1.75))
         self._knockout_cache: Optional[pygame.Surface] = None
+
+        # Master volume (0.0..1.0); defaults to current music level / 1.0 baseline mapping
+        self.master_volume: float = 1.0
+        self._apply_master_volume()
+
+    def _apply_master_volume(self) -> None:
+        try:
+            # Scale music relative to configured music volume (0.324 base)
+            pygame.mixer.music.set_volume(0.324 * self.master_volume)
+        except Exception:
+            pass
+        # Scale SFX if available
+        if getattr(self.assets, 'sfx_knockout', None):
+            try:
+                self.assets.sfx_knockout.set_volume(self.assets.knockout_base * self.master_volume)
+            except Exception:
+                pass
+        if getattr(self.assets, 'sfx_revive', None):
+            try:
+                self.assets.sfx_revive.set_volume(self.assets.revive_base * self.master_volume)
+            except Exception:
+                pass
+        if getattr(self.assets, 'sfx_point', None):
+            try:
+                self.assets.sfx_point.set_volume(self.assets.point_base * self.master_volume)
+            except Exception:
+                pass
 
         # Prepare Timer UI scaling to fit top bar
         self._prepare_timer_ui()
@@ -1080,7 +1111,29 @@ class Game:
         esc_rect = esc_img.get_rect(midleft=(pause_rect.right + 2 * self.tile_size, pause_rect.centery))
         self.screen.blit(esc_img, esc_rect)
 
-        # Grid toggle removed per request
+        # Master Volume slider at bottom center
+        slider_w = int(self.tile_size * 10)
+        slider_h = int(self.tile_size * 0.6)
+        slider_rect = pygame.Rect(0, 0, slider_w, slider_h)
+        slider_rect.midbottom = (self.screen_size_px[0] // 2, self.screen_size_px[1] - 12)
+        # Track
+        pygame.draw.rect(self.screen, (0, 0, 0), slider_rect, border_radius=6)
+        inner_s = slider_rect.inflate(-4, -4)
+        pygame.draw.rect(self.screen, (60, 60, 60), inner_s, border_radius=6)
+        # Fill based on master volume
+        fill_w = int(inner_s.width * max(0.0, min(1.0, self.master_volume)))
+        fill_rect = pygame.Rect(inner_s.left, inner_s.top, fill_w, inner_s.height)
+        pygame.draw.rect(self.screen, (50, 120, 255), fill_rect, border_radius=6)
+        # Knob
+        knob_x = fill_rect.right
+        knob = pygame.Rect(0, 0, int(self.tile_size * 0.6), int(self.tile_size * 0.9))
+        knob.midbottom = (max(inner_s.left, min(inner_s.right, knob_x)), slider_rect.bottom)
+        pygame.draw.rect(self.screen, (200, 200, 200), knob, border_radius=4)
+        # Label
+        vol_label = self.font_small.render("Master Volume", True, (255, 255, 255))
+        self.screen.blit(vol_label, vol_label.get_rect(midbottom=(slider_rect.centerx, slider_rect.top - 4)))
+        # Cache for interaction
+        self._menu_volume_slider_rect = inner_s
 
     def draw_game_over(self) -> None:
         if self.result_text == "You Win!":
@@ -1269,6 +1322,11 @@ class Game:
     def handle_event(self, event: pygame.event.Event) -> None:
         if self.state == "MENU":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                # Volume slider interaction
+                if hasattr(self, "_menu_volume_slider_rect") and self._menu_volume_slider_rect.collidepoint(event.pos):
+                    rel = (event.pos[0] - self._menu_volume_slider_rect.left) / max(1, self._menu_volume_slider_rect.width)
+                    self.master_volume = max(0.0, min(1.0, rel))
+                    self._apply_master_volume()
                 if hasattr(self, "_menu_button_rect") and self._menu_button_rect.collidepoint(event.pos):
                     # Start 2s flash animation before leaving menu
                     self.menu_start_triggered_ms = pygame.time.get_ticks()
@@ -1291,6 +1349,11 @@ class Game:
                     self._menu_pending_duration_ms = 20 * 1000
                 elif hasattr(self, "_menu_grid_button_rect") and self._menu_grid_button_rect.collidepoint(event.pos):
                     self.show_menu_grid = not self.show_menu_grid
+            elif event.type == pygame.MOUSEMOTION and event.buttons[0]:
+                if hasattr(self, "_menu_volume_slider_rect") and self._menu_volume_slider_rect.collidepoint(event.pos):
+                    rel = (event.pos[0] - self._menu_volume_slider_rect.left) / max(1, self._menu_volume_slider_rect.width)
+                    self.master_volume = max(0.0, min(1.0, rel))
+                    self._apply_master_volume()
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 # No-op in menu
                 pass
@@ -1368,7 +1431,7 @@ def main() -> None:
         music_path = os.path.join(base_dir, "assets", "sounds", "MainTheme.mp3")
         if os.path.exists(music_path):
             pygame.mixer.music.load(music_path)
-            pygame.mixer.music.set_volume(0.54)
+            pygame.mixer.music.set_volume(0.324)
             pygame.mixer.music.play(-1)
     except Exception:
         # Audio is optional; continue without music if unavailable
