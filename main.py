@@ -47,10 +47,13 @@ class AssetLoader:
         self.player_head = load_image("PlayerCharacter.png")
         self.player_head_ko = load_image("PlayerCharacterKnockout.png")
         self.enemy_head = load_image("Enemy.png")
+        self.enemy_head_ko = load_image("enemyKnockout.png")
         self.enemy_segment = load_image("EnemySegment.png")
         self.point = load_image("DiamondPoint.png")
         # UI
         self.timer_ui = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "TimerUI.png")).convert_alpha()
+        self.fight_ui_dark = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUIDark.png")).convert_alpha()
+        self.fight_ui_light = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUILight.png")).convert_alpha()
 
         # Player segments 2..16
         self.player_segments: List[pygame.Surface] = []
@@ -207,17 +210,26 @@ class Game:
         self.world_rect = world_rect
         self.world_size_px = (self.world_rect.width, self.world_rect.height)
         self.screen_size_px = self.screen.get_size()
-        self.ui_rect = pygame.Rect(0, 0, self.screen_size_px[0], self.screen_size_px[1] - self.world_rect.height)
+        # UI area: fixed 450x120 centered at top
+        ui_height = self.screen_size_px[1] - self.world_rect.height
+        ui_width = 450
+        self.ui_rect = pygame.Rect(0, 0, ui_width, ui_height)
+        self.ui_rect.centerx = self.screen_size_px[0] // 2
+        self.ui_rect.top = 0
 
         # State
         self.points: List[GridPos] = []
         self.last_point_spawn_ms: int = 0
         self.last_move_ms: int = 0
         self.start_time_ms: int = 0
-        self.state: str = "MENU"  # MENU, COUNTDOWN, PLAYING, GAME_OVER
+        self.state: str = "MENU"  # MENU, COUNTDOWN, PREFIGHT, PLAYING, PAUSED, PAUSE_COUNTDOWN, GAME_OVER
         self.countdown_start_ms: int = 0
+        self.prefight_start_ms: int = 0
+        self.pause_start_ms: int = 0
+        self.pause_countdown_start_ms: int = 0
         self.result_text: str = ""
         self.high_score: int = self.load_high_score()
+        self._paused_elapsed_ms: int = 0
 
         # Snakes setup: near borders facing inward
         player_start = (2, self.grid_cells // 2)
@@ -275,6 +287,10 @@ class Game:
         self.last_move_ms = now_ms
         self.last_point_spawn_ms = now_ms
 
+    def start_prefight(self, now_ms: int) -> None:
+        self.state = "PREFIGHT"
+        self.prefight_start_ms = now_ms
+
     def end_game(self) -> None:
         # Player loses if they have less points than any enemy at end of 3 minutes
         player_score = self.player.score
@@ -288,6 +304,33 @@ class Game:
             self.save_high_score(player_score)
         self.state = "GAME_OVER"
 
+    def _pause_game(self) -> None:
+        if self.state not in ("PLAYING", "COUNTDOWN"):
+            return
+        self.state = "PAUSED"
+        self.pause_start_ms = pygame.time.get_ticks()
+
+    def _resume_with_countdown(self) -> None:
+        if self.state != "PAUSED":
+            return
+        self.state = "PAUSE_COUNTDOWN"
+        self.pause_countdown_start_ms = pygame.time.get_ticks()
+
+    def _finalize_resume_from_pause(self, now_ms: int) -> None:
+        # Compute total paused time and shift all timers so gameplay resumes seamlessly
+        paused_duration = now_ms - self.pause_start_ms + (now_ms - self.pause_countdown_start_ms)
+        # Shift core timers
+        self.start_time_ms += paused_duration
+        self.last_move_ms += paused_duration
+        self.last_point_spawn_ms += paused_duration
+        # Shift player/enemy knockout timers if applicable
+        for s in [self.player] + self.enemies:
+            if s.eliminated:
+                s.knockout_time_ms += paused_duration
+                s.death_anim_end_ms += paused_duration
+                s.inactive_until_ms += paused_duration
+        self.state = "PLAYING"
+
     def reset_world(self) -> None:
         self.player.reset()
         for e in self.enemies:
@@ -298,7 +341,22 @@ class Game:
     def update(self, now_ms: int) -> None:
         if self.state == "COUNTDOWN":
             if now_ms - self.countdown_start_ms >= 3000:
+                self.start_prefight(now_ms)
+            return
+
+        if self.state == "PREFIGHT":
+            # 1s total prefight animation then start game
+            if now_ms - self.prefight_start_ms >= 1000:
                 self.start_game(now_ms)
+            return
+
+        if self.state == "PAUSED":
+            # Frozen
+            return
+
+        if self.state == "PAUSE_COUNTDOWN":
+            if now_ms - self.pause_countdown_start_ms >= 3000:
+                self._finalize_resume_from_pause(now_ms)
             return
 
         if self.state != "PLAYING":
@@ -386,7 +444,11 @@ class Game:
         for s in snakes:
             if s.eliminated:
                 continue
-            if s.collides_with_walls(self.grid_cells) or s.collides_with_self():
+            if s.collides_with_walls(self.grid_cells):
+                # Stop at boundary by reverting to previous in-bounds position
+                s.body = list(s.prev_body)
+                s.eliminate(now_ms, self.settings.respawn_delay_ms)
+            elif s.collides_with_self():
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
 
         # Pairwise collisions using head rules
@@ -431,6 +493,13 @@ class Game:
             self.draw_hud(countdown=True)
             return
 
+        if self.state == "PREFIGHT":
+            self.draw_points()
+            self.draw_snakes()
+            self.draw_hud()
+            self.draw_prefight()
+            return
+
         if self.state == "PLAYING":
             self.draw_points()
             self.draw_snakes()
@@ -438,6 +507,20 @@ class Game:
             # Knockout visual: grayscale fade-in over 0.5s when player is eliminated
             if self.player.eliminated:
                 self.draw_knockout_overlay()
+            return
+
+        if self.state == "PAUSED":
+            self.draw_points()
+            self.draw_snakes()
+            self.draw_hud()
+            self.draw_pause_menu()
+            return
+
+        if self.state == "PAUSE_COUNTDOWN":
+            self.draw_points()
+            self.draw_snakes()
+            self.draw_hud()
+            self.draw_pause_countdown()
             return
 
         if self.state == "GAME_OVER":
@@ -479,11 +562,8 @@ class Game:
         if not snake.body:
             return
 
-        # If eliminated, decide visibility: enemies disappear immediately; player shows 0.5s disintegration then disappears
+        # If eliminated, decide visibility: show 0.5s disintegration then disappear for both player and enemies
         if snake.eliminated:
-            if not snake.is_player:
-                return
-            # Player: allow rendering only during disintegration window
             if pygame.time.get_ticks() >= snake.death_anim_end_ms:
                 return
 
@@ -518,8 +598,8 @@ class Game:
             body_index = len(positions_px) - 1 - idx
             is_head = (body_index == 0)
             if is_head:
-                if snake.is_player and snake.eliminated:
-                    img = self.assets.player_head_ko
+                if snake.eliminated:
+                    img = self.assets.player_head_ko if snake.is_player else self.assets.enemy_head_ko
                 else:
                     img = snake.head_image
             else:
@@ -529,8 +609,8 @@ class Game:
                     img = self.assets.get_player_segment_image(segment_number)
                 else:
                     img = self.assets.enemy_segment
-            # Disintegration for eliminated player: sequential tail->head over 0.5s
-            if snake.is_player and snake.eliminated:
+            # Disintegration for eliminated snake: sequential tail->head over 0.5s
+            if snake.eliminated:
                 t = pygame.time.get_ticks()
                 if t < snake.death_anim_end_ms:
                     duration = 500
@@ -559,8 +639,12 @@ class Game:
         self.screen.blit(composite, (self.world_rect.left + min_px, self.world_rect.top + min_py))
 
     def draw_hud(self, countdown: bool = False) -> None:
-        # Scores and timer
-        elapsed_ms = max(0, pygame.time.get_ticks() - self.start_time_ms)
+        # Scores and timer (freeze during pause and pause-countdown)
+        if self.state in ("PAUSED", "PAUSE_COUNTDOWN"):
+            now_time = self.pause_start_ms
+        else:
+            now_time = pygame.time.get_ticks()
+        elapsed_ms = max(0, now_time - self.start_time_ms)
         remaining_ms = max(0, self.settings.game_duration_ms - elapsed_ms)
         remaining_s = remaining_ms // 1000
 
@@ -600,6 +684,48 @@ class Game:
                 rect = overlay.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
                 self.screen.blit(overlay, rect)
 
+    def draw_pause_menu(self) -> None:
+        # Dim overlay across whole screen
+        dim = pygame.Surface(self.screen_size_px, pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 150))
+        self.screen.blit(dim, (0, 0))
+
+        title = self.font_large.render("Paused", True, (255, 255, 255))
+        title_rect = title.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.35)))
+        self.screen.blit(title, title_rect)
+
+        btn_w, btn_h = int(self.tile_size * 6), int(self.tile_size * 2)
+        gap = int(self.tile_size * 0.8)
+        # Continue button
+        cont_rect = pygame.Rect(0, 0, btn_w, btn_h)
+        cont_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.5))
+        # Main menu button
+        menu_rect = pygame.Rect(0, 0, btn_w, btn_h)
+        menu_rect.center = (self.screen_size_px[0] // 2, cont_rect.bottom + gap + btn_h // 2)
+
+        # Draw buttons
+        for rect, text in ((cont_rect, "Continue"), (menu_rect, "Main Menu")):
+            pygame.draw.rect(self.screen, (0, 0, 0), rect, border_radius=8)
+            inner = rect.inflate(-4, -4)
+            pygame.draw.rect(self.screen, (50, 120, 255), inner, border_radius=8)
+            label = self.font_medium.render(text, True, (255, 255, 255))
+            self.screen.blit(label, label.get_rect(center=inner.center))
+
+        self._pause_continue_rect = cont_rect
+        self._pause_menu_rect = menu_rect
+
+    def draw_pause_countdown(self) -> None:
+        dim = pygame.Surface(self.screen_size_px, pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 150))
+        self.screen.blit(dim, (0, 0))
+        t = pygame.time.get_ticks() - self.pause_countdown_start_ms
+        remaining = max(0, 3000 - t)
+        num = 1 + remaining // 1000
+        msg = str(int(num))
+        surf = self.font_large.render(msg, True, (255, 255, 255))
+        rect = surf.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
+        self.screen.blit(surf, rect)
+
     def draw_menu(self) -> None:
         title = self.font_large.render("Serpent Showdown", True, (255, 255, 255))
         prompt = self.font_medium.render("Click Start", True, (255, 255, 0))
@@ -635,15 +761,19 @@ class Game:
         # Copy current world area
         self._knockout_cache.blit(self.screen, (0, 0), area=self.world_rect)
         gray = to_grayscale(self._knockout_cache)
-        # Fade factor
+        # Fade factor: fade in over first 0.5s; fade out over last 2s before respawn
+        alpha = 1.0
         if self.player.eliminated and self.player.knockout_time_ms > 0:
             t = pygame.time.get_ticks()
-            duration = 500
-            elapsed = max(0, t - self.player.knockout_time_ms)
-            alpha = max(0.0, min(1.0, elapsed / duration))
-        else:
-            alpha = 1.0
-        # Blend gray over current world
+            fade_in_end = self.player.death_anim_end_ms
+            fade_out_start = self.player.inactive_until_ms - 2000
+            if t < fade_in_end:
+                # Fade in 0..1 over 0.5s
+                alpha = max(0.0, min(1.0, (t - self.player.knockout_time_ms) / 500.0))
+            elif t >= fade_out_start:
+                # Fade out 1..0 over last 2s
+                alpha = max(0.0, min(1.0, (self.player.inactive_until_ms - t) / 2000.0))
+        # Blend gray over current world according to alpha factor
         gray_surface = gray.convert_alpha()
         fade = pygame.Surface(self.world_size_px, pygame.SRCALPHA)
         fade.fill((255, 255, 255, int(alpha * 255)))
@@ -655,9 +785,9 @@ class Game:
         self.screen.blit(ko, rect)
 
     def _prepare_timer_ui(self) -> None:
-        # Fit TimerUI into ui_rect height with small margins; center horizontally
+        # Fit TimerUI into ui_rect height (120) with small margins; center horizontally
         margin = 6
-        target_h = max(24, int((self.ui_rect.height - 2 * margin) * 0.75))  # 25% smaller
+        target_h = max(24, int((self.ui_rect.height - 2 * margin) * 0.75))  # keep 25% smaller styling
         ui = self.assets.timer_ui
         scale = target_h / ui.get_height()
         target_w = int(ui.get_width() * scale)
@@ -666,14 +796,42 @@ class Game:
         self._timer_ui_rect.center = (self.ui_rect.centerx, self.ui_rect.top + self.ui_rect.height // 2)
         self._timer_text_center = self._timer_ui_rect.center
 
+    def draw_prefight(self) -> None:
+        # 1s total: two flashes in the first 0.5s, then slide off-screen
+        t_ms = pygame.time.get_ticks() - self.prefight_start_ms
+        center = (self.world_rect.centerx, self.world_rect.centery)
+        # Scale fight UI to about 60% of world width
+        max_w = int(self.world_rect.width * 0.6)
+        # Choose current frame (light primary, dark flashes twice at ~125ms and ~375ms for ~100ms each)
+        show_dark = (125 <= t_ms < 225) or (375 <= t_ms < 475)
+        img = self.assets.fight_ui_dark if show_dark else self.assets.fight_ui_light
+        scale = max_w / img.get_width()
+        target_size = (int(img.get_width() * scale), int(img.get_height() * scale))
+        frame = pygame.transform.smoothscale(img, target_size)
+
+        # Slide off-screen to the right during last 0.3s (700ms -> 1000ms)
+        if t_ms >= 700:
+            slide_frac = min(1.0, (t_ms - 700) / 300.0)
+            offset_x = int(slide_frac * (self.world_rect.width // 2 + target_size[0]))
+        else:
+            offset_x = 0
+
+        rect = frame.get_rect(center=(center[0] + offset_x, center[1]))
+        self.screen.blit(frame, rect)
+
     # -------------------- Input --------------------
     def handle_event(self, event: pygame.event.Event) -> None:
         if self.state == "MENU":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if hasattr(self, "_menu_button_rect") and self._menu_button_rect.collidepoint(event.pos):
                     self.start_countdown(pygame.time.get_ticks())
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                # No-op in menu
+                pass
         elif self.state == "GAME_OVER":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.state = "MENU"
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.state = "MENU"
         elif self.state in ("COUNTDOWN", "PLAYING"):
             if event.type == pygame.KEYDOWN:
@@ -685,6 +843,20 @@ class Game:
                     self.player.set_direction((0, 1))
                 elif event.key in (pygame.K_UP, pygame.K_w):
                     self.player.set_direction((0, -1))
+                elif event.key == pygame.K_ESCAPE:
+                    self._pause_game()
+        elif self.state == "PAUSED":
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self._resume_with_countdown()
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if hasattr(self, "_pause_continue_rect") and self._pause_continue_rect.collidepoint(event.pos):
+                    self._resume_with_countdown()
+                elif hasattr(self, "_pause_menu_rect") and self._pause_menu_rect.collidepoint(event.pos):
+                    self.state = "MENU"
+        elif self.state == "PAUSE_COUNTDOWN":
+            # Ignore inputs during countdown except ESC to return to PAUSED
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.state = "PAUSED"
 
 
 def detect_tile_size(base_dir: str, grid_cells: int) -> int:
@@ -708,14 +880,11 @@ def main() -> None:
     pygame.display.set_caption("Serpent Showdown")
 
     grid_cells = 25
-    # Target overall window height and ~75% world area
-    target_win_h = 720
-    target_world_h = int(target_win_h * 0.75)
-    tile_size = max(16, target_world_h // grid_cells)
-    world_h = tile_size * grid_cells
-    win_h = target_win_h
-    win_w = world_h  # keep square width matching world for simplicity
-    ui_bar_h = win_h - world_h
+    # Fixed world 600x600 (24px tiles), UI 120px tall, window 600x720
+    tile_size = 24
+    world_h = tile_size * grid_cells  # 600
+    win_w = world_h
+    win_h = world_h + 120
     screen = pygame.display.set_mode((win_w, win_h))
     world_rect = pygame.Rect(0, win_h - world_h, world_h, world_h)
 
