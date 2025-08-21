@@ -54,6 +54,7 @@ class AssetLoader:
         self.timer_ui = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "TimerUI.png")).convert_alpha()
         self.fight_ui_dark = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUIDark.png")).convert_alpha()
         self.fight_ui_light = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUILight.png")).convert_alpha()
+        self.ko_effect = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "KOEffect.png")).convert_alpha()
 
         # Player segments 2..16
         self.player_segments: List[pygame.Surface] = []
@@ -103,6 +104,10 @@ class Snake:
         # Knockout animation timing (used for player)
         self.knockout_time_ms: int = 0
         self.death_anim_end_ms: int = 0
+        # KO effect placement/animation
+        self.ko_effect_start_ms: int = 0
+        self.ko_effect_anchor_px: Tuple[int, int] = (0, 0)
+        self.ko_effect_dir_px: Tuple[int, int] = (0, 0)
 
     @property
     def head(self) -> GridPos:
@@ -146,6 +151,8 @@ class Snake:
         # Reserve first 500ms for disintegration/fade-in; countdown begins after
         self.death_anim_end_ms = now_ms + 500
         self.inactive_until_ms = self.death_anim_end_ms + (respawn_delay_ms)
+        # Start KO effect
+        self.ko_effect_start_ms = now_ms
 
     def try_respawn(self, now_ms: int) -> None:
         if self.eliminated and now_ms >= self.inactive_until_ms:
@@ -447,8 +454,10 @@ class Game:
             if s.collides_with_walls(self.grid_cells):
                 # Stop at boundary by reverting to previous in-bounds position
                 s.body = list(s.prev_body)
+                self._set_ko_effect_for_snake(s)
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
             elif s.collides_with_self():
+                self._set_ko_effect_for_snake(s)
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
 
         # Pairwise collisions using head rules
@@ -473,6 +482,7 @@ class Game:
 
         for s in to_eliminate:
             if not s.eliminated:
+                self._set_ko_effect_for_snake(s)
                 s.eliminate(now_ms, self.settings.respawn_delay_ms)
 
     # -------------------- Render --------------------
@@ -507,12 +517,15 @@ class Game:
             # Knockout visual: grayscale fade-in over 0.5s when player is eliminated
             if self.player.eliminated:
                 self.draw_knockout_overlay()
+            # KO effects for any eliminated snakes
+            self.draw_ko_effects()
             return
 
         if self.state == "PAUSED":
             self.draw_points()
             self.draw_snakes()
             self.draw_hud()
+            self.draw_ko_effects()
             self.draw_pause_menu()
             return
 
@@ -520,12 +533,14 @@ class Game:
             self.draw_points()
             self.draw_snakes()
             self.draw_hud()
+            self.draw_ko_effects()
             self.draw_pause_countdown()
             return
 
         if self.state == "GAME_OVER":
             self.draw_points()
             self.draw_snakes()
+            self.draw_ko_effects()
             self.draw_game_over()
 
     def grid_to_px(self, pos: GridPos) -> Tuple[int, int]:
@@ -818,6 +833,56 @@ class Game:
 
         rect = frame.get_rect(center=(center[0] + offset_x, center[1]))
         self.screen.blit(frame, rect)
+
+    def _set_ko_effect_for_snake(self, snake: Snake) -> None:
+        # Anchor near head position at tile center, slightly forward-right relative to direction
+        head_x, head_y = snake.head
+        base_px = self.world_rect.left + head_x * self.tile_size + self.tile_size // 2
+        base_py = self.world_rect.top + head_y * self.tile_size + self.tile_size // 2
+        # Offset diagonally from head depending on direction
+        dx, dy = snake.direction
+        off_x = (dx - dy) * (self.tile_size // 2)
+        off_y = (dx + dy) * (-self.tile_size // 2)
+        snake.ko_effect_anchor_px = (base_px + off_x, base_py + off_y)
+        snake.ko_effect_start_ms = pygame.time.get_ticks()
+
+    def draw_ko_effects(self) -> None:
+        # KO effect lasts 1s from ko_effect_start_ms and bounces in/out
+        effect_img = self.assets.ko_effect
+        # Base size ~2.0x tile (100% larger than head size)
+        base_size = int(self.tile_size * 2.0)
+        for s in [self.player] + self.enemies:
+            if s.ko_effect_start_ms <= 0:
+                continue
+            t = pygame.time.get_ticks() - s.ko_effect_start_ms
+            if t >= 1000:
+                # End of effect
+                s.ko_effect_start_ms = 0
+                continue
+            # Ease pop in (0-200ms), hold, then pop out 50% faster (~867-1000ms)
+            if t < 200:
+                k = t / 200.0
+            elif t > 867:
+                k = max(0.0, (1000 - t) / 133.0)
+            else:
+                k = 1.0
+            scale = 0.6 + 0.4 * k  # from 60% to 100%
+            size = int(base_size * scale)
+            size = max(1, size)
+            scaled = pygame.transform.smoothscale(effect_img, (size, size))
+            # Slight diagonal rotation
+            rotated = pygame.transform.rotozoom(scaled, -20, 1.0)
+            # Slight bob
+            bob = int(4 * k)
+            half_w = rotated.get_width() // 2
+            half_h = rotated.get_height() // 2
+            cx = s.ko_effect_anchor_px[0]
+            cy = s.ko_effect_anchor_px[1] - bob
+            # Clamp to remain inside world bounds
+            cx = max(self.world_rect.left + half_w, min(self.world_rect.right - half_w, cx))
+            cy = max(self.world_rect.top + half_h, min(self.world_rect.bottom - half_h, cy))
+            pos = (cx - half_w, cy - half_h)
+            self.screen.blit(rotated, pos)
 
     # -------------------- Input --------------------
     def handle_event(self, event: pygame.event.Event) -> None:
