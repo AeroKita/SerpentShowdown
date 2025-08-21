@@ -55,6 +55,8 @@ class AssetLoader:
         self.fight_ui_dark = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUIDark.png")).convert_alpha()
         self.fight_ui_light = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "FightUILight.png")).convert_alpha()
         self.ko_effect = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "KOEffect.png")).convert_alpha()
+        self.times_up = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "TimesUp.png")).convert_alpha()
+        self.logo = pygame.image.load(os.path.join(self.base_dir, "assets", "images", "SSLogo.png")).convert_alpha()
 
         # Player segments 2..16
         self.player_segments: List[pygame.Surface] = []
@@ -237,6 +239,16 @@ class Game:
         self.result_text: str = ""
         self.high_score: int = self.load_high_score()
         self._paused_elapsed_ms: int = 0
+        self._times_up_start_ms: int = 0
+        self.postgame_phase: Optional[str] = None  # None, "TIMES_UP", "TALLY", "RESULT"
+        self._tally_index: int = 0
+        self._tally_count: int = 0
+        self._tally_last_tick_ms: int = 0
+        self._tally_counts: List[int] = [0, 0, 0]
+        # Match duration for this round (default 2 minutes)
+        self.current_match_duration_ms: int = self.settings.game_duration_ms
+        # Whether to skip tally counters at end (winner by default conditions)
+        self.skip_tally: bool = False
 
         # Snakes setup: near borders facing inward
         player_start = (2, self.grid_cells // 2)
@@ -258,6 +270,7 @@ class Game:
         self.font_large = pygame.font.SysFont(None, int(self.tile_size * 1.2))
         self.font_medium = pygame.font.SysFont(None, int(self.tile_size * 0.9))
         self.font_small = pygame.font.SysFont(None, int(self.tile_size * 0.7))
+        self.font_counter = pygame.font.SysFont(None, int(self.tile_size * 1.8))
         self._knockout_cache: Optional[pygame.Surface] = None
 
         # Prepare Timer UI scaling to fit top bar
@@ -283,9 +296,13 @@ class Game:
             pass
 
     # -------------------- Game Flow --------------------
-    def start_countdown(self, now_ms: int) -> None:
+    def start_countdown(self, now_ms: int, duration_ms: Optional[int] = None) -> None:
         self.state = "COUNTDOWN"
         self.countdown_start_ms = now_ms
+        # Set per-round match duration
+        self.current_match_duration_ms = (
+            duration_ms if duration_ms is not None else self.settings.game_duration_ms
+        )
         self.reset_world()
 
     def start_game(self, now_ms: int) -> None:
@@ -299,16 +316,26 @@ class Game:
         self.prefight_start_ms = now_ms
 
     def end_game(self) -> None:
-        # Player loses if they have less points than any enemy at end of 3 minutes
+        # Determine winner at time-up
+        living = [s for s in [self.player] + self.enemies if not s.eliminated]
         player_score = self.player.score
-        enemy_best = max(e.score for e in self.enemies)
-        if player_score < enemy_best:
-            self.result_text = "Game Over"
+        enemy_best = max((e.score for e in self.enemies), default=0)
+        # If only one entity is alive on the field, they win by default (skip tally)
+        if len(living) == 1:
+            self.result_text = "You Win!" if living[0] is self.player else "Game Over"
+            self.skip_tally = True
         else:
-            self.result_text = "You Win!"
+            # Fall back to score comparison
+            self.result_text = "Game Over" if player_score < enemy_best else "You Win!"
+            self.skip_tally = False
         if player_score > self.high_score:
             self.high_score = player_score
             self.save_high_score(player_score)
+        self._times_up_start_ms = pygame.time.get_ticks()
+        self.postgame_phase = "TIMES_UP"
+        self._tally_index = 0
+        self._tally_count = 0
+        self._tally_last_tick_ms = 0
         self.state = "GAME_OVER"
 
     def _pause_game(self) -> None:
@@ -343,6 +370,18 @@ class Game:
         for e in self.enemies:
             e.reset()
         self.points.clear()
+        # Reset gameplay timers so a new match shows full 2:00 until start
+        self.start_time_ms = 0
+        self.last_move_ms = 0
+        self.last_point_spawn_ms = 0
+        # Reset postgame visuals
+        self._times_up_start_ms = 0
+        self.postgame_phase = None
+        self._tally_index = 0
+        self._tally_count = 0
+        self._tally_last_tick_ms = 0
+        self._tally_counts = [0, 0, 0]
+        self.skip_tally = False
 
     # -------------------- Update --------------------
     def update(self, now_ms: int) -> None:
@@ -370,7 +409,7 @@ class Game:
             return
 
         # Timer end
-        if now_ms - self.start_time_ms >= self.settings.game_duration_ms:
+        if now_ms - self.start_time_ms >= self.current_match_duration_ms:
             self.end_game()
             return
 
@@ -541,7 +580,24 @@ class Game:
             self.draw_points()
             self.draw_snakes()
             self.draw_ko_effects()
-            self.draw_game_over()
+            if self.postgame_phase == "TIMES_UP":
+                self.draw_times_up()
+                if pygame.time.get_ticks() - self._times_up_start_ms >= 1500:
+                    # Begin tallying scores unless skipping tally (winner by default)
+                    if self.skip_tally:
+                        self.postgame_phase = "RESULT"
+                    else:
+                        self.postgame_phase = "TALLY"
+                        self._tally_index = 0  # 0: enemy1, 1: enemy2, 2: player
+                        self._tally_count = 0
+                        self._tally_last_tick_ms = pygame.time.get_ticks()
+                        self._tally_counts = [0, 0, 0]
+            elif self.postgame_phase == "TALLY":
+                self.draw_tally_counters()
+            else:
+                # RESULT or fallback: keep counters on screen and show final message
+                self.draw_tally_counters()
+                self.draw_game_over()
 
     def grid_to_px(self, pos: GridPos) -> Tuple[int, int]:
         return self.world_rect.left + pos[0] * self.tile_size, self.world_rect.top + pos[1] * self.tile_size
@@ -654,13 +710,18 @@ class Game:
         self.screen.blit(composite, (self.world_rect.left + min_px, self.world_rect.top + min_py))
 
     def draw_hud(self, countdown: bool = False) -> None:
-        # Scores and timer (freeze during pause and pause-countdown)
-        if self.state in ("PAUSED", "PAUSE_COUNTDOWN"):
-            now_time = self.pause_start_ms
+        # Scores and timer
+        if self.state in ("MENU", "COUNTDOWN", "PREFIGHT"):
+            # Always display full duration until actual gameplay starts
+            remaining_ms = self.current_match_duration_ms
         else:
-            now_time = pygame.time.get_ticks()
-        elapsed_ms = max(0, now_time - self.start_time_ms)
-        remaining_ms = max(0, self.settings.game_duration_ms - elapsed_ms)
+            # Freeze during pause and pause-countdown; otherwise tick normally
+            if self.state in ("PAUSED", "PAUSE_COUNTDOWN"):
+                now_time = self.pause_start_ms
+            else:
+                now_time = pygame.time.get_ticks()
+            elapsed_ms = max(0, now_time - self.start_time_ms)
+            remaining_ms = max(0, self.current_match_duration_ms - elapsed_ms)
         remaining_s = remaining_ms // 1000
 
         # Draw Timer UI background centered in top bar
@@ -675,10 +736,7 @@ class Game:
         timer_rect = timer_surf.get_rect(center=self._timer_text_center)
         self.screen.blit(timer_surf, timer_rect)
 
-        # Scores on left side of the UI bar
-        scores = f"Score: {self.player.score}   High: {self.high_score}   E1: {self.enemy1.score}   E2: {self.enemy2.score}"
-        score_surf = self.font_small.render(scores, True, (255, 255, 255))
-        self.screen.blit(score_surf, (self.ui_rect.left + 8, self.ui_rect.top + 8))
+        # (Removed per request) scores in top UI bar
 
         if countdown:
             t = pygame.time.get_ticks() - self.countdown_start_ms
@@ -742,16 +800,22 @@ class Game:
         self.screen.blit(surf, rect)
 
     def draw_menu(self) -> None:
-        title = self.font_large.render("Serpent Showdown", True, (255, 255, 255))
+        # Logo
+        max_w = int(self.screen_size_px[0] * 0.8)
+        scale = min(1.0, max_w / max(1, self.assets.logo.get_width()))
+        logo = pygame.transform.smoothscale(
+            self.assets.logo,
+            (int(self.assets.logo.get_width() * scale), int(self.assets.logo.get_height() * scale)),
+        )
         prompt = self.font_medium.render("Click Start", True, (255, 255, 0))
         high = self.font_small.render(f"High Score: {self.high_score}", True, (200, 200, 255))
 
-        title_rect = title.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.35)))
+        title_rect = logo.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.30)))
         btn_w, btn_h = int(self.tile_size * 6), int(self.tile_size * 2)
         btn_rect = pygame.Rect(0, 0, btn_w, btn_h)
         btn_rect.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.6))
 
-        self.screen.blit(title, title_rect)
+        self.screen.blit(logo, title_rect)
         self.screen.blit(high, (title_rect.left, title_rect.bottom + 10))
 
         pygame.draw.rect(self.screen, (0, 0, 0), btn_rect, border_radius=8)
@@ -762,12 +826,77 @@ class Game:
 
         self._menu_button_rect = btn_rect  # cache for click detection
 
+        # Dev Test Arena button (20-second match)
+        dev_btn = pygame.Rect(0, 0, btn_w, btn_h)
+        dev_btn.center = (self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.75))
+        pygame.draw.rect(self.screen, (0, 0, 0), dev_btn, border_radius=8)
+        inner2 = dev_btn.inflate(-4, -4)
+        pygame.draw.rect(self.screen, (120, 50, 255), inner2, border_radius=8)
+        dev_label = self.font_medium.render("Dev Test Arena", True, (255, 255, 255))
+        self.screen.blit(dev_label, dev_label.get_rect(center=inner2.center))
+        self._menu_dev_button_rect = dev_btn
+
     def draw_game_over(self) -> None:
         msg = self.font_large.render(self.result_text, True, (255, 200, 50))
         info = self.font_small.render("Click to return to Menu", True, (230, 230, 230))
         rect = msg.get_rect(center=(self.screen_size_px[0] // 2, int(self.screen_size_px[1] * 0.45)))
         self.screen.blit(msg, rect)
         self.screen.blit(info, (rect.left, rect.bottom + 10))
+
+    def draw_tally_counters(self) -> None:
+        # Tick the counter faster (75% faster than prior 250ms -> ~143ms)
+        now = pygame.time.get_ticks()
+        order = [self.enemy1, self.enemy2, self.player]
+        # Only advance counts if we are still tallying and index is valid
+        if self.postgame_phase == "TALLY" and self._tally_index < len(order):
+            current = order[self._tally_index]
+            target = len(current.body)
+            if self._tally_last_tick_ms == 0:
+                self._tally_last_tick_ms = now
+            if now - self._tally_last_tick_ms >= 143:
+                self._tally_last_tick_ms = now
+                if self._tally_count < target:
+                    self._tally_count += 1
+                    self._tally_counts[self._tally_index] = self._tally_count
+                else:
+                    # Move to next entity or finish
+                    self._tally_index += 1
+                    if self._tally_index >= len(order):
+                        # Done tallying; lock into result phase
+                        self.postgame_phase = "RESULT"
+                    else:
+                        self._tally_count = 0
+
+        # Draw counters as black boxes with large white text above each head; persist after finish
+        for idx, snake in enumerate(order):
+            if self.postgame_phase == "RESULT":
+                count_val = self._tally_counts[idx]
+            else:
+                count_val = self._tally_counts[idx] if (idx < self._tally_index) else (self._tally_count if idx == self._tally_index else 0)
+            head_px = self.grid_to_px(snake.head)
+            cx = head_px[0] + self.tile_size // 2
+            cy = head_px[1] - int(self.tile_size * 0.8)
+            text = self.font_counter.render(str(count_val), False, (255, 255, 255))
+            pad = 8
+            box = text.get_rect()
+            box.inflate_ip(pad * 2, pad)
+            box.center = (cx, cy)
+            pygame.draw.rect(self.screen, (0, 0, 0), box, border_radius=6)
+            self.screen.blit(text, text.get_rect(center=box.center))
+
+    def draw_times_up(self) -> None:
+        if self._times_up_start_ms <= 0:
+            return
+        t = pygame.time.get_ticks() - self._times_up_start_ms
+        if t > 1500:
+            return
+        img = self.assets.times_up
+        # Make it large: ~70% of world width
+        max_w = int(self.world_rect.width * 0.7)
+        scale = max_w / img.get_width()
+        target = pygame.transform.smoothscale(img, (int(img.get_width() * scale), int(img.get_height() * scale)))
+        rect = target.get_rect(center=(self.world_rect.centerx, self.world_rect.centery))
+        self.screen.blit(target, rect)
 
     def draw_knockout_overlay(self) -> None:
         # Render the current frame into an offscreen surface and grayscale it, with 0.5s fade-in
@@ -889,7 +1018,10 @@ class Game:
         if self.state == "MENU":
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if hasattr(self, "_menu_button_rect") and self._menu_button_rect.collidepoint(event.pos):
-                    self.start_countdown(pygame.time.get_ticks())
+                    self.start_countdown(pygame.time.get_ticks(), duration_ms=self.settings.game_duration_ms)
+                elif hasattr(self, "_menu_dev_button_rect") and self._menu_dev_button_rect.collidepoint(event.pos):
+                    # 20-second test arena
+                    self.start_countdown(pygame.time.get_ticks(), duration_ms=20 * 1000)
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 # No-op in menu
                 pass
